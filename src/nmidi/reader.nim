@@ -97,8 +97,6 @@ proc getMidiAction*(r: Reader, act: var MidiAction): bool =
   of System:
     # act = MidiAction(st: System, Note: r.read())
     return false # TODO implement
-  else:
-    return false # TODO error enum instead?
 
   act.channel = chan
   true
