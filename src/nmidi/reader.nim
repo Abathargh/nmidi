@@ -1,8 +1,13 @@
 type
-  Reader* = concept
+  Reader* = concept  ## \
+  ## A Reader is any type that provides a read proc returning uint8.
+  ## This allows for this library to remain architecture-agnostic.
+  ## NOTE: this may change in the near future to account for errors.
     proc read(r: Self): uint8
 
-  Status* = enum
+  Status* = enum ## \
+  ## MIDI possible status codes. Not interchangeable with their underlying
+  ## values - they are not mapped to the actual status byte values.
     NoteOff
     NoteOn
     PolyPress
@@ -11,8 +16,15 @@ type
     ChanPress
     PitchBend
     System
+    Error
 
-  MidiAction* = object
+  MidiError = enum
+    StatusExpected
+    DataExpected
+    InvalidStatus
+
+  MidiAction* = object ## \
+  ## A midi action is
     channel*: uint8
     case st*: Status
     of NoteOff:
@@ -35,13 +47,15 @@ type
       bend*: uint16
     of System:
       Note*: uint8 # TODO implement
+    of Error:
+      error: MidiError
 
 const
-  statusOffset = 0x8
-  NextNum = ## \
+  nextNum = ## \
       ## After a specific status word is received, the next 'n' words are to be
       ## data ones. This table encodes a status <-> # data words relation.
       [2.uint8, 2, 2, 2, 1, 1, 2, 0]
+  biggestRead = 2
 
 
 template numDataWords*(st: Status): uint8 =
@@ -52,6 +66,7 @@ template numDataWords*(st: Status): uint8 =
 
 
 proc statusFromByte(b: uint8, st: var Status): bool =
+  const statusOffset = 0x8
   let val = (b and 0xf0'u8) shr 4
   if val < 0x08 or val > 0x0f:
     return false
@@ -59,44 +74,68 @@ proc statusFromByte(b: uint8, st: var Status): bool =
   true
 
 
-template isStatusWord*(w: uint8): bool =
+template isStatusWord(w: uint8): bool =
   (w and 0b10000000) > 0
 
 
-proc getMidiAction*(r: Reader, act: var MidiAction): bool =
+template makeError(handle: var MidiAction, err: MidiError) =
+  handle = MidiAction(st: Error, error: err)
+
+
+proc getMidiAction*(reader: Reader, act: var MidiAction) =
   ## midi state machine implementation
-  let b = r.read()
-  if not isStatusWord(b):
-    echo b
-    return false # TODO error enum instead?
+  var
+    readBuf: array[biggestRead, uint8]
+    status: Status
+    chan: uint8
+    start = 0'u8
 
-  let chan = (b and 0x0f'u8)
-  var st: Status
-  if not statusFromByte(b, st):
-    return false # TODO error enum instead?
+  let byte = reader.read()
 
-  case st
+  if isStatusWord(byte):
+    chan = (byte and 0x0f'u8)
+    if not statusFromByte(byte, status):
+      makeError(act, InvalidStatus)
+      return
+  else:
+    status = act.st
+    chan = act.channel
+    readBuf[0] = byte
+    inc start
+
+    if status == Error:
+      makeError(act, StatusExpected)
+      return
+
+  let numReads = nextNum[cast[uint8](status)]
+  for i in start..<numReads:
+    readBuf[i] = reader.read()
+    if isStatusWord(readBuf[i]):
+      makeError(act, DataExpected)
+      return
+
+  case status
   of NoteOff:
-    act = MidiAction(st: NoteOff, offNote: r.read(), offVelocity: r.read())
+    act = MidiAction(st: NoteOff, offNote: readBuf[0], offVelocity: readBuf[1])
   of NoteOn:
-    act = MidiAction(st: NoteOn, onNote: r.read(), onVelocity: r.read())
+    act = MidiAction(st: NoteOn, onNote: readBuf[0], onVelocity: readBuf[1])
   of PolyPress:
-    act = MidiAction(st: PolyPress, polyNote: r.read(), polyPressure: r.read())
+    act = MidiAction(st: PolyPress, polyNote: readBuf[0], polyPressure: readBuf[1])
   of CtlChange:
-    act = MidiAction(st: CtlChange, controller: r.read(), value: r.read())
+    act = MidiAction(st: CtlChange, controller: readBuf[0], value: readBuf[1])
   of PrgChange:
-    act = MidiAction(st: PrgChange, program: r.read())
+    act = MidiAction(st: PrgChange, program: readBuf[0])
   of ChanPress:
-    act = MidiAction(st: ChanPress, chanPressure: r.read())
+    act = MidiAction(st: ChanPress, chanPressure: readBuf[0])
   of PitchBend:
     let
-      lsb = r.read()
-      msb = r.read()
+      lsb = readBuf[0]
+      msb = readBuf[1]
       bend = (msb.uint16 shl 7) or (lsb.uint16)
-    act = MidiAction(st: PitchBend, bend: r.read())
+    act = MidiAction(st: PitchBend, bend: bend)
   of System:
     # act = MidiAction(st: System, Note: r.read())
-    return false # TODO implement
-
+    discard
+  of Error:
+    discard
   act.channel = chan
-  true
